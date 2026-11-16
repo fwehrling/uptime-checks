@@ -1,0 +1,72 @@
+name: checks
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+    - cron: "17 6 1 * *"
+  workflow_dispatch:
+    inputs:
+      test_failure:
+        description: "Simulate an outage to test the alert"
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: checks
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    if: github.event.schedule != '17 6 1 * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    env:
+      SITE_URL: ${{ secrets.SITE_URL }}
+      ADMIN_URL: ${{ secrets.ADMIN_URL }}
+      API_URL: ${{ secrets.API_URL }}
+      API_KEY: ${{ secrets.API_KEY }}
+      TEST_FAILURE: ${{ inputs.test_failure || 'false' }}
+    steps:
+      - name: Probe endpoints
+        shell: bash
+        run: |
+          set -u
+          failed=0
+          # check NAME MIN MAX URL [curl options...] ; 3 attempts, 20 s apart
+          check() {
+            local name=$1 min=$2 max=$3 url=$4; shift 4
+            local code=000
+            for attempt in 1 2 3; do
+              code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "$@" "$url" || true)
+              if [ "$code" -ge "$min" ] && [ "$code" -le "$max" ]; then
+                echo "OK   $name ($code)"; return 0
+              fi
+              [ "$attempt" -lt 3 ] && sleep 20
+            done
+            echo "::error::DOWN $name (HTTP $code after 3 attempts)"
+            failed=1
+          }
+          auth=(-H "apikey: $API_KEY" -H "Authorization: Bearer $API_KEY")
+          check site      200 299 "$SITE_URL"
+          check admin     200 299 "$ADMIN_URL" -L
+          check auth      200 299 "$API_URL/auth/v1/health" "${auth[@]}"
+          check storage   200 299 "$API_URL/storage/v1/status" "${auth[@]}"
+          check database  200 499 "$API_URL/rest/v1/profiles?select=id&limit=0" "${auth[@]}"
+          if [ "$TEST_FAILURE" = "true" ]; then
+            echo "::error::Simulated outage (alert test)"; failed=1
+          fi
+          exit $failed
+
+  keepalive:
+    if: github.event.schedule == '17 6 1 * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      actions: write
+    steps:
+      - name: Keep the scheduled workflow enabled
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/checks.yml/enable"
